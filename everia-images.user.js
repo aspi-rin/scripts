@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Everia Article Images to ZIP (All Pages)
+// @name         Everia Images to ZIP (Articles & Galleries)
 // @namespace    local.everia.image-downloader
-// @version      1.4.1
-// @description  Add a button below the article title to download its main images from all pages as a ZIP named after the article.
+// @version      1.5.0
+// @description  Download all article pages as ZIP, or select gallery previews to download each album as a separate ZIP.
 // @match        https://everia.club/*
 // @match        https://www.everia.club/*
 // @run-at       document-idle
@@ -16,7 +16,7 @@
 (() => {
   'use strict';
 
-  // Image hosts can change, so @connect uses *. Requests are limited to this article's pages and matching content images.
+  // Image hosts can change. Requests are limited to the chosen articles and their matching content images.
   const CONCURRENCY = 3;
   const MAX_PAGES = 500;
   const EXCLUDED = [
@@ -31,7 +31,11 @@
   const requests = new Set();
   const imageTransports = new Map();
   const initial = articleAddress(location.href);
-  if (!initial) return;
+  const selected = new Map();
+  const galleryCards = new Map();
+  const zipURLs = new Set();
+  const archiveNames = new Set();
+  let progressPrefix = '';
 
   function articleAddress(raw, relativeTo = location.href) {
     try {
@@ -166,8 +170,8 @@
     }
   }
 
-  async function collectArticle() {
-    const known = new Map([[1, { ...initial, page: 1, url: initial.base }]]);
+  async function collectArticle(source) {
+    const known = new Map([[1, { ...source, page: 1, url: source.base }]]);
     const visited = new Set();
     const collected = new Map();
     const pageFailures = [];
@@ -181,9 +185,9 @@
       status(`Reading page ${next} (${known.size} pages found)...`);
       try {
         const parsed = await retry(async () => {
-          const r = await request(page.url, 'text', initial.base);
+          const r = await request(page.url, 'text', source.base);
           const final = articleAddress(r.finalUrl || page.url);
-          if (!final || final.key !== initial.key || final.page !== next) throw new Error('Article page redirected to a different page');
+          if (!final || final.key !== source.key || final.page !== next) throw new Error('Article page redirected to a different page');
           const doc = new DOMParser().parseFromString(r.responseText || r.response, 'text/html');
           const info = contentOf(doc, first?.id);
           const images = extractImages(info.content, page.url);
@@ -192,7 +196,7 @@
         });
         first ||= parsed;
         collected.set(next, parsed.images);
-        for (const info of extractPages(parsed.article, page.url, initial.key)) {
+        for (const info of extractPages(parsed.article, page.url, source.key)) {
           if (!known.has(info.page)) known.set(info.page, info);
         }
       } catch (e) {
@@ -343,70 +347,153 @@
       #error{color:#9d2222;font-size:12px;max-height:160px;overflow:auto}
       button,a{font:inherit}button{padding:9px 14px;margin:0 6px 0 0;border:0;border-radius:6px;cursor:pointer;background:#286bc4;color:white}
       button:disabled{opacity:.55;cursor:default}#stop{background:#934c4c}a{display:block;color:#155ab5;margin-top:8px}
+      button{min-height:40px}button:focus-visible,a:focus-visible{outline:3px solid #155ab5;outline-offset:3px}
+      button:active:not(:disabled){transform:scale(.96)}#selection{font-variant-numeric:tabular-nums}
+      :host([gallery]){position:sticky;top:8px;z-index:100}
+      #choices{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+      #choices button{margin:0;background:#dce8f7;color:#194878}
+      #results{max-height:240px;overflow:auto}
+      #results p{color:#9d2222}
       [hidden]{display:none!important}
     </style>
     <div class="box">
+      <div id="choices" hidden>
+        <button id="select-all" type="button">Select All on This Page</button>
+        <button id="clear" type="button">Clear Selection</button>
+        <button id="clear-results" type="button">Clear ZIP Links</button>
+        <span id="selection" aria-live="polite">0 selected</span>
+      </div>
       <button id="zip" type="button">Download All Images as ZIP</button>
       <button id="stop" type="button" hidden>Cancel</button>
       <p id="status" role="status" aria-live="polite">Collect all article pages and download only this article's main images.</p>
       <p id="error" hidden role="status"></p>
-      <a id="result" hidden>Save ZIP</a>
+      <div id="results"></div>
     </div>`;
   const zipButton = ui.getElementById('zip');
   const stopButton = ui.getElementById('stop');
   const output = ui.getElementById('status');
   const errorOutput = ui.getElementById('error');
-  const result = ui.getElementById('result');
-  let zipURL;
-  function status(text) { output.textContent = text; }
+  const results = ui.getElementById('results');
+  const selectAllButton = ui.getElementById('select-all');
+  const clearButton = ui.getElementById('clear');
+  const clearResultsButton = ui.getElementById('clear-results');
+  const selectionOutput = ui.getElementById('selection');
+  let activeCount = 0;
+  if (!initial) {
+    host.setAttribute('gallery', '');
+    ui.getElementById('choices').hidden = false;
+    output.textContent = 'Select album previews, then download each selected album as a separate ZIP.';
+  }
+  function status(text) { output.textContent = progressPrefix + text; }
   function busy(value) {
     running = value;
-    zipButton.disabled = value;
-    zipButton.textContent = value ? 'Downloading and creating ZIP...' : 'Download All Images as ZIP';
+    zipButton.disabled = value || (!initial && !selected.size);
+    const buttonText = value ? (initial ? 'Downloading and creating ZIP...' : `Creating ${activeCount} selected ZIPs...`)
+      : (initial ? 'Download All Images as ZIP' : `Download Selected ZIPs (${selected.size})`);
+    if (zipButton.textContent !== buttonText) zipButton.textContent = buttonText;
     stopButton.hidden = !value;
     stopButton.disabled = !value;
+    selectAllButton.disabled = value || !galleryCards.size;
+    clearButton.disabled = value || !selected.size;
+    clearResultsButton.disabled = value || !results.childElementCount;
+    const selectionText = `${selected.size} selected`;
+    if (selectionOutput.textContent !== selectionText) selectionOutput.textContent = selectionText;
+    for (const { input, info, control } of galleryCards.values()) {
+      input.disabled = value;
+      input.checked = selected.has(info.key);
+      control.toggleAttribute('selected', input.checked);
+    }
+  }
+
+  async function createArticleZip(source, JSZip) {
+    const info = await collectArticle(source);
+    checkCancelled();
+    const title = safeName(info.title);
+    const zip = new JSZip();
+    const zipFolder = zip.folder(title);
+    const { saved, failures } = await saveImages(info, zipFolder);
+    if (!saved) throw new Error('All image downloads failed. No empty ZIP was created. See the error details in red below.');
+    const incomplete = failures.length > 0 || info.pageFailures.length > 0;
+    if (incomplete) {
+      zipFolder.file('download-failures.json', JSON.stringify({ title: info.title, source: source.base, saved,
+        pageFailures: info.pageFailures, imageFailures: failures }, null, 2));
+    }
+    status('Creating ZIP...');
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE', streamFiles: true }, meta => {
+      checkCancelled();
+      status(`Creating ZIP: ${meta.percent.toFixed(0)}%`);
+    });
+    checkCancelled();
+    return { blob, title, saved, incomplete, total: info.images.length, pages: info.pages,
+      missingPages: info.pageFailures.length, missingImages: failures.length };
+  }
+
+  function releaseZips() {
+    for (const url of zipURLs) URL.revokeObjectURL(url);
+    zipURLs.clear();
+    archiveNames.clear();
+    results.replaceChildren();
+  }
+
+  function saveArchive(archive, names) {
+    let filename = `${archive.title}.zip`, suffix = 2;
+    while (names.has(filename.toLowerCase())) filename = `${archive.title} (${suffix++}).zip`;
+    names.add(filename.toLowerCase());
+    const url = URL.createObjectURL(archive.blob);
+    zipURLs.add(url);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.textContent = `Save ${filename}${archive.incomplete ? ' (partial)' : ''}`;
+    results.append(link);
+    link.click();
   }
 
   async function start() {
     if (running) return;
+    const queue = initial ? [initial] : [...selected.values()];
+    if (!queue.length) return;
     cancelled = false;
+    activeCount = queue.length;
     busy(true);
-    if (zipURL) { URL.revokeObjectURL(zipURL); zipURL = null; }
-    result.hidden = true;
+    // Keep completed gallery save links available while retrying failed or cancelled albums.
+    if (initial) releaseZips();
     errorOutput.hidden = true;
     errorOutput.textContent = '';
+    let completed = 0, partial = 0, failed = 0;
+    const names = archiveNames;
     try {
       const JSZip = bundledZip();
-      const info = await collectArticle();
-      checkCancelled();
-      const title = safeName(info.title);
-      const zip = new JSZip();
-      const zipFolder = zip.folder(title);
-      const { saved, failures } = await saveImages(info, zipFolder);
-      if (!saved) throw new Error('All image downloads failed. No empty ZIP was created. See the error details in red below.');
-      const incomplete = failures.length > 0 || info.pageFailures.length > 0;
-      if (incomplete) {
-        const report = JSON.stringify({ title: info.title, source: initial.base, saved,
-          pageFailures: info.pageFailures, imageFailures: failures }, null, 2);
-        zipFolder.file('download-failures.json', report);
-      }
-      status('Creating ZIP...');
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE', streamFiles: true }, meta => {
+      // One album at a time: retain the existing three-image concurrency within each album.
+      for (const [index, source] of queue.entries()) {
         checkCancelled();
-        status(`Creating ZIP: ${meta.percent.toFixed(0)}%`);
-      });
-      checkCancelled();
-      zipURL = URL.createObjectURL(blob);
-      result.href = zipURL;
-      result.download = `${title}.zip`;
-      result.textContent = `Save ${title}.zip`;
-      result.hidden = false;
-      result.click();
-      status(`${incomplete ? 'Partially complete' : 'Complete'}: ${saved}/${info.images.length} images, ${info.pages} pages.\n`
-        + 'ZIP created. If the download has not started, click the save link below.'
-        + (incomplete ? `\nMissing ${info.pageFailures.length} pages and ${failures.length} images. See download-failures.json for details.` : ''));
+        progressPrefix = initial ? '' : `Album ${index + 1}/${queue.length}: ${source.title}\n`;
+        try {
+          const archive = await createArticleZip(source, JSZip);
+          saveArchive(archive, names);
+          completed++;
+          if (archive.incomplete) partial++;
+          // Completed albums leave the selection; failed or cancelled albums stay selected for retry.
+          if (!initial) selected.delete(source.key);
+          else status(`${archive.incomplete ? 'Partially complete' : 'Complete'}: ${archive.saved}/${archive.total} images, ${archive.pages} pages.\n`
+            + 'ZIP created. If the download has not started, click the save link below.'
+            + (archive.incomplete ? `\nMissing ${archive.missingPages} pages and ${archive.missingImages} images. See download-failures.json for details.` : ''));
+        } catch (e) {
+          if (cancelled || e.name === 'AbortError' || initial) throw e;
+          failed++;
+          const note = document.createElement('p');
+          note.textContent = `Failed: ${source.title}\n${e.message}`;
+          results.append(note);
+          console.warn('[Everia album failure]', source.base, e);
+        }
+      }
+      progressPrefix = '';
+      if (!initial) status(`${completed}/${queue.length} ZIPs created${partial ? ` (${partial} partial)` : ''}; ${failed} failed.\n`
+        + 'If automatic downloads are blocked, allow multiple downloads for this site or use the save links below.');
     } catch (e) {
-      status(e.name === 'AbortError' ? 'Cancelled. Click the button to download again.' : `Stopped: ${e.message}\nClick the button to download again.`);
+      progressPrefix = '';
+      status(e.name === 'AbortError' ? `Cancelled. ${completed} ZIPs already created. Remaining selections are ready to retry.`
+        : `Stopped: ${e.message}\nClick the button to download again.`);
       console.error('[Everia download]', e);
     } finally { busy(false); }
   }
@@ -417,7 +504,24 @@
     for (const r of [...requests]) r.abort();
     status('Cancelling...');
   });
-  function mount() {
+  selectAllButton.addEventListener('click', () => {
+    if (running) return;
+    for (const { info } of galleryCards.values()) selected.set(info.key, info);
+    busy(false);
+  });
+  clearButton.addEventListener('click', () => {
+    if (running) return;
+    selected.clear();
+    busy(false);
+  });
+  clearResultsButton.addEventListener('click', () => {
+    if (running) return;
+    releaseZips();
+    busy(false);
+  });
+  window.addEventListener('beforeunload', releaseZips);
+
+  function mountArticle() {
     const article = document.querySelector('article[id^="post-"]');
     const title = article?.querySelector('.single-post-title, .entry-title, [itemprop="headline"]');
     if (!title || !article.querySelector('.entry-content')) return false;
@@ -425,12 +529,83 @@
     return true;
   }
 
-  // Insert the button even when article content loads late. The menu can restore and scroll to the button.
+  function mountGallery() {
+    // The same Post Grid markup is used by the home page, country galleries, and their pagination.
+    const gallerySelector = '#primary .rt-tpg-container .rt-grid-item[data-id]';
+    for (const [card, entry] of galleryCards) {
+      if (!card.isConnected || !entry.control.isConnected || !card.matches(gallerySelector) || card.closest(EXCLUDED)) {
+        entry.control.remove();
+        galleryCards.delete(card);
+      }
+    }
+    const cards = document.querySelectorAll(gallerySelector);
+    for (const card of cards) {
+      if (card.closest(EXCLUDED)) continue;
+      const link = card.querySelector('.entry-title a.tpg-post-link[href], .rt-img-holder a.tpg-post-link[href]');
+      const info = link && articleAddress(link.href);
+      const thumbnail = card.querySelector('.rt-img-holder');
+      const existing = galleryCards.get(card);
+      if (!info || !thumbnail || !thumbnail.querySelector('img')) {
+        existing?.control.remove();
+        galleryCards.delete(card);
+        continue;
+      }
+      info.title = card.querySelector('.entry-title')?.textContent.trim() || thumbnail.querySelector('img').alt || 'Everia album';
+      if (existing && existing.control.parentElement === thumbnail) {
+        existing.info = info;
+        existing.input.setAttribute('aria-label', `Select ${info.title} for ZIP download`);
+        if (selected.has(info.key)) selected.set(info.key, info);
+        continue;
+      }
+      existing?.control.remove();
+      const control = document.createElement('span');
+      control.className = 'everia-zip-select';
+      Object.assign(control.style, { position: 'absolute', top: '8px', left: '8px', zIndex: '10' });
+      const shadow = control.attachShadow({ mode: 'open' });
+      shadow.innerHTML = `<style>
+        :host{all:initial;display:block}label{display:flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;
+          box-sizing:border-box;border-radius:8px;background:#fffffff2;box-shadow:0 1px 5px #0003;cursor:pointer}
+        :host([selected]) label{background:#dcecff}:host(:focus-within) label{outline:3px solid #155ab5;outline-offset:2px}
+        input{width:20px;height:20px;margin:0;accent-color:#286bc4;cursor:pointer}
+        input:disabled{cursor:default}
+      </style><label title="Select album for ZIP download"><input type="checkbox"></label>`;
+      const input = shadow.querySelector('input');
+      const entry = { info, input, control };
+      input.setAttribute('aria-label', `Select ${info.title} for ZIP download`);
+      input.addEventListener('change', () => {
+        if (running) { busy(true); return; }
+        if (input.checked) selected.set(entry.info.key, entry.info);
+        else selected.delete(entry.info.key);
+        busy(false);
+      });
+      control.addEventListener('click', event => event.stopPropagation());
+      if (getComputedStyle(thumbnail).position === 'static') thumbnail.style.position = 'relative';
+      // Outside the thumbnail anchor: selecting a preview preserves the gallery page.
+      thumbnail.append(control);
+      galleryCards.set(card, entry);
+    }
+    const visible = new Set([...galleryCards.values()].map(entry => entry.info.key));
+    for (const key of selected.keys()) if (!visible.has(key)) selected.delete(key);
+    busy(running);
+    const grid = document.querySelector('#primary .rt-tpg-container');
+    if (!grid || !galleryCards.size) return false;
+    if (host.nextElementSibling !== grid) grid.before(host);
+    return true;
+  }
+
+  function mount() { return initial ? mountArticle() : mountGallery(); }
+  // Restore controls for late-loaded or replaced gallery cards without duplicating checkboxes.
+  let mountTimer;
   const observer = new MutationObserver(() => {
-    if (mount()) observer.disconnect();
+    clearTimeout(mountTimer);
+    mountTimer = setTimeout(() => {
+      if (mount() && initial) observer.disconnect();
+    }, 50);
   });
-  if (!mount()) observer.observe(document.documentElement, { childList: true, subtree: true });
-  GM_registerMenuCommand('Locate Article ZIP Download Button', () => {
+  if (!mount() || !initial) observer.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-id'],
+  });
+  GM_registerMenuCommand(initial ? 'Locate Article ZIP Download Button' : 'Locate Gallery ZIP Download Controls', () => {
     if (mount()) host.scrollIntoView({ behavior: 'smooth', block: 'center' });
   });
   busy(false);
