@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Everia Images to ZIP (Articles & Galleries)
 // @namespace    local.everia.image-downloader
-// @version      1.5.0
-// @description  Download all article pages as ZIP, or select gallery previews to download each album as a separate ZIP.
+// @version      1.5.1
+// @description  Download all article pages as ZIP, or select gallery and archive previews to download each album as a separate ZIP.
 // @match        https://everia.club/*
 // @match        https://www.everia.club/*
 // @run-at       document-idle
@@ -530,8 +530,8 @@
   }
 
   function mountGallery() {
-    // The same Post Grid markup is used by the home page, country galleries, and their pagination.
-    const gallerySelector = '#primary .rt-tpg-container .rt-grid-item[data-id]';
+    // Post Grid galleries and OceanWP tag/category archives share the same selection workflow.
+    const gallerySelector = '#primary .rt-tpg-container .rt-grid-item[data-id], #primary #blog-entries > article.blog-entry[id^="post-"]';
     for (const [card, entry] of galleryCards) {
       if (!card.isConnected || !entry.control.isConnected || !card.matches(gallerySelector) || card.closest(EXCLUDED)) {
         entry.control.remove();
@@ -541,9 +541,10 @@
     const cards = document.querySelectorAll(gallerySelector);
     for (const card of cards) {
       if (card.closest(EXCLUDED)) continue;
-      const link = card.querySelector('.entry-title a.tpg-post-link[href], .rt-img-holder a.tpg-post-link[href]');
+      const link = card.querySelector('.entry-title a[href]')
+        || card.querySelector('.rt-img-holder a.tpg-post-link[href], .thumbnail a.thumbnail-link[href]');
       const info = link && articleAddress(link.href);
-      const thumbnail = card.querySelector('.rt-img-holder');
+      const thumbnail = card.querySelector('.rt-img-holder, .thumbnail');
       const existing = galleryCards.get(card);
       if (!info || !thumbnail || !thumbnail.querySelector('img')) {
         existing?.control.remove();
@@ -587,7 +588,7 @@
     const visible = new Set([...galleryCards.values()].map(entry => entry.info.key));
     for (const key of selected.keys()) if (!visible.has(key)) selected.delete(key);
     busy(running);
-    const grid = document.querySelector('#primary .rt-tpg-container');
+    const grid = galleryCards.keys().next().value?.closest('.rt-tpg-container, #blog-entries');
     if (!grid || !galleryCards.size) return false;
     if (host.nextElementSibling !== grid) grid.before(host);
     return true;
@@ -603,7 +604,7 @@
     }, 50);
   });
   if (!mount() || !initial) observer.observe(document.documentElement, {
-    childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-id'],
+    childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'data-id', 'id'],
   });
   GM_registerMenuCommand(initial ? 'Locate Article ZIP Download Button' : 'Locate Gallery ZIP Download Controls', () => {
     if (mount()) host.scrollIntoView({ behavior: 'smooth', block: 'center' });
