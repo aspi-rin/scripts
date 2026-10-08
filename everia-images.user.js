@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Everia Images to ZIP (Articles & Galleries)
 // @namespace    local.everia.image-downloader
-// @version      1.5.1
-// @description  Download all article pages as ZIP, or select gallery and archive previews to download each album as a separate ZIP.
+// @version      1.6.0
+// @description  Download article images as ZIP, automatically join matching adjacent split images, or select albums for separate ZIPs.
 // @match        https://everia.club/*
 // @match        https://www.everia.club/*
 // @run-at       document-idle
@@ -207,6 +207,7 @@
     const seen = new Set();
     const images = [...collected.entries()].sort((a, b) => a[0] - b[0])
       .flatMap(([page, items]) => items.map(item => ({ ...item, page })))
+      .map((item, position) => ({ ...item, position }))
       .filter(item => { if (seen.has(item.url)) return false; seen.add(item.url); return true; });
     return { title: first.title, images, pageFailures, pages: known.size };
   }
@@ -297,16 +298,147 @@
     return `${String(index + 1).padStart(4, '0')}_${safeName(stem, 65)}.${ext}`;
   }
 
+  function imageOperation(operation, dispose = () => {}) {
+    checkCancelled();
+    return new Promise((resolve, reject) => {
+      let settled = false, timer;
+      const control = { abort: () => finish(reject, new DOMException('Cancelled', 'AbortError')) };
+      function finish(fn, value) {
+        if (settled) { if (fn === resolve) dispose(value); return; }
+        settled = true;
+        clearTimeout(timer);
+        requests.delete(control);
+        fn(value);
+      }
+      requests.add(control);
+      timer = setTimeout(() => finish(reject, new Error('Image processing timed out')), 10000);
+      Promise.resolve().then(() => { checkCancelled(); return operation(); })
+        .then(value => finish(resolve, value), error => finish(reject, error));
+    });
+  }
+
+  function staticImage(record) {
+    const b = record.buffer;
+    if (record.ext === 'gif') return false;
+    // Preserve animated WebP/APNG as their original files.
+    if (record.ext === 'webp' && b.length > 20 && String.fromCharCode(...b.slice(12, 16)) === 'VP8X' && (b[20] & 2)) return false;
+    if (record.ext === 'png') {
+      for (let offset = 8; offset + 12 <= b.length;) {
+        const length = new DataView(b.buffer, b.byteOffset + offset, 4).getUint32(0);
+        if (String.fromCharCode(...b.slice(offset + 4, offset + 8)) === 'acTL') return false;
+        offset += length + 12;
+      }
+    }
+    return record.ext !== 'avif';
+  }
+
+  function edgeProfiles(image) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 4; canvas.height = image.height;
+    try {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) throw new Error('Canvas unavailable');
+      const columns = [0, 16, image.width - 17, image.width - 1];
+      columns.forEach((x, i) => ctx.drawImage(image, x, 0, 1, image.height, i, 0, 1, image.height));
+      const pixels = ctx.getImageData(0, 0, 4, image.height).data;
+      return columns.map((_, column) => Array.from({ length: 256 }, (_, bin) => {
+        const first = Math.floor(bin * image.height / 256), last = Math.floor((bin + 1) * image.height / 256);
+        const rgb = [0, 0, 0];
+        for (let y = first; y < last; y++) {
+          const at = (y * 4 + column) * 4;
+          if (pixels[at + 3] !== 255) throw new Error('Transparent edge');
+          for (let c = 0; c < 3; c++) rgb[c] += pixels[at + c];
+        }
+        return rgb.map(value => value / (last - first));
+      }));
+    } finally { canvas.width = canvas.height = 1; }
+  }
+
+  function correlation(a, b) {
+    const mean = values => values.reduce((sum, value) => sum + value, 0) / values.length;
+    const ma = mean(a), mb = mean(b);
+    let va = 0, vb = 0, covariance = 0;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i] - ma, y = b[i] - mb;
+      va += x * x; vb += y * y; covariance += x * y;
+    }
+    return { value: va && vb ? covariance / Math.sqrt(va * vb) : 0,
+      stdA: Math.sqrt(va / a.length), stdB: Math.sqrt(vb / b.length) };
+  }
+
+  function edgeDistance(a, b) {
+    return a.reduce((sum, rgb, i) => sum + rgb.reduce((n, value, c) => n + Math.abs(value - b[i][c]), 0), 0) / (a.length * 3);
+  }
+
+  function matchingSeam(left, right) {
+    const a = left[3], b = right[0];
+    const mae = edgeDistance(a, b);
+    const errors = a.map((rgb, i) => rgb.reduce((sum, value, c) => sum + Math.abs(value - b[i][c]), 0) / 3).sort((x, y) => x - y);
+    const luminance = rows => rows.map(([r, g, b]) => .2126 * r + .7152 * g + .0722 * b);
+    const la = luminance(a), lb = luminance(b);
+    const luma = correlation(la, lb);
+    const gradients = values => values.slice(1).map((value, i) => value - values[i]);
+    const ga = gradients(la), gb = gradients(lb);
+    const gradient = correlation(ga, gb);
+    const active = values => values.filter(value => Math.abs(value) >= 2).length / values.length;
+    // Inset columns must disagree: matching flat backgrounds or repeated vertical bands are ambiguous.
+    const insetError = Math.min(edgeDistance(left[2], b), edgeDistance(a, right[1]));
+    const matches = mae <= 8 && errors[Math.floor(.95 * (errors.length - 1))] <= 25
+      && luma.value >= .97 && Math.min(luma.stdA, luma.stdB) >= 15
+      && gradient.value >= .70 && Math.min(gradient.stdA, gradient.stdB) >= 2
+      && Math.min(active(ga), active(gb)) >= .15
+      && insetError >= Math.max(mae * 1.5, mae + 4);
+    return { matches, mae };
+  }
+
+  async function tryStitchPair(first, second) {
+    if (typeof createImageBitmap !== 'function' || !staticImage(first) || !staticImage(second)) return null;
+    if (second.item.page - first.item.page > 1
+      || (Number.isInteger(first.item.position) && second.item.position !== first.item.position + 1)) return null;
+    let a, b, canvas;
+    try {
+      a = await imageOperation(() => createImageBitmap(new Blob([first.buffer])), value => value.close());
+      b = await imageOperation(() => createImageBitmap(new Blob([second.buffer])), value => value.close());
+      checkCancelled();
+      const width = a.width + b.width, height = a.height;
+      if (height !== b.height || height < 256 || Math.min(a.width, b.width) < 64
+        || Math.max(a.width, b.width) > height * 1.1 || width < height || width > height * 2.2
+        || Math.max(width, height) > 16384 || width * height > 32000000) return null;
+      const pa = edgeProfiles(a), pb = edgeProfiles(b);
+      const forward = matchingSeam(pa, pb), reverse = matchingSeam(pb, pa);
+      const reversed = reverse.mae < forward.mae;
+      const best = reversed ? reverse : forward, other = reversed ? forward : reverse;
+      if (!best.matches || other.mae < Math.max(best.mae * 2, 15)) return null;
+      canvas = document.createElement('canvas');
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas unavailable');
+      const left = reversed ? b : a, right = reversed ? a : b;
+      ctx.drawImage(left, 0, 0); ctx.drawImage(right, left.width, 0);
+      const blob = await imageOperation(() => new Promise((resolve, reject) => {
+        canvas.toBlob(value => value ? resolve(value) : reject(new Error('PNG encoding failed')), 'image/png');
+      }));
+      const buffer = new Uint8Array(await imageOperation(() => blob.arrayBuffer()));
+      checkCancelled();
+      if (!buffer.length || imageExtension(buffer) !== 'png') throw new Error('PNG encoding failed');
+      return { buffer, ext: 'png', reversed };
+    } catch (e) {
+      if (cancelled || e.name === 'AbortError') throw e;
+      console.debug('[Everia stitch skipped]', e.message);
+      return null;
+    } finally { a?.close(); b?.close(); if (canvas) canvas.width = canvas.height = 1; }
+  }
+
   async function saveImages(info, zipFolder) {
-    let cursor = 0, completed = 0, saved = 0, fatal;
-    const failures = [];
+    let cursor = 0, completed = 0, saved = 0;
+    const failures = [], downloaded = new Array(info.images.length);
     async function worker() {
-      while (cursor < info.images.length && !cancelled && !fatal) {
-        const index = cursor++;
-        const item = info.images[index];
-        let buffer, ext;
+      while (cursor < info.images.length && !cancelled) {
+        const index = cursor++, item = info.images[index];
         try {
-          ({ buffer, ext } = await retry(() => downloadImage(item)));
+          const { buffer, ext } = await retry(() => downloadImage(item));
+          downloaded[index] = { buffer, ext, item, index };
+          saved++;
         } catch (e) {
           if (cancelled || e.name === 'AbortError') return;
           failures.push({ index: index + 1, ...item, error: e.message });
@@ -314,26 +446,32 @@
           errorOutput.textContent = `Latest failure: page ${item.page}, image ${index + 1}\n${e.message}\n${item.url}`;
           console.warn('[Everia image failure]', item.url, e);
         }
-        if (buffer) {
-          const name = fileName(item, index, ext);
-          try {
-            checkCancelled();
-            // Convert to the current script's data type to support ArrayBuffers returned from another extension context.
-            zipFolder.file(name, new Uint8Array(buffer));
-            saved++;
-          } catch (e) {
-            if (!cancelled) fatal = new Error(`Could not add image to ZIP: ${e.message}`);
-            return;
-          }
-        }
         completed++;
         status(`${info.pages} pages | Processed ${completed}/${info.images.length} images\nSucceeded: ${saved}, failed: ${failures.length}`);
       }
     }
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    if (fatal) throw fatal;
     checkCancelled();
-    return { saved, failures };
+    let stitched = 0, imageFiles = 0;
+    for (let index = 0; index < downloaded.length; index++) {
+      checkCancelled();
+      const first = downloaded[index];
+      if (!first) continue;
+      const second = downloaded[index + 1];
+      const joined = second ? await tryStitchPair(first, second) : null;
+      checkCancelled();
+      const name = joined
+        ? fileName(first.item, first.index, 'png').replace(/\.png$/, `--${String(second.index + 1).padStart(4, '0')}_joined.png`)
+        : fileName(first.item, first.index, first.ext);
+      try { zipFolder.file(name, new Uint8Array((joined || first).buffer)); }
+      catch (e) { throw new Error(`Could not add image to ZIP: ${e.message}`); }
+      downloaded[index] = null;
+      if (joined) { downloaded[++index] = null; stitched++; }
+      imageFiles++;
+      status(`Packing images: ${index + 1}/${info.images.length}\nJoined pairs: ${stitched}`);
+    }
+    checkCancelled();
+    return { saved, failures, stitched, imageFiles };
   }
 
   const host = document.createElement('div');
@@ -411,7 +549,7 @@
     const title = safeName(info.title);
     const zip = new JSZip();
     const zipFolder = zip.folder(title);
-    const { saved, failures } = await saveImages(info, zipFolder);
+    const { saved, failures, stitched, imageFiles } = await saveImages(info, zipFolder);
     if (!saved) throw new Error('All image downloads failed. No empty ZIP was created. See the error details in red below.');
     const incomplete = failures.length > 0 || info.pageFailures.length > 0;
     if (incomplete) {
@@ -424,7 +562,7 @@
       status(`Creating ZIP: ${meta.percent.toFixed(0)}%`);
     });
     checkCancelled();
-    return { blob, title, saved, incomplete, total: info.images.length, pages: info.pages,
+    return { blob, title, saved, stitched, imageFiles, incomplete, total: info.images.length, pages: info.pages,
       missingPages: info.pageFailures.length, missingImages: failures.length };
   }
 
@@ -477,6 +615,7 @@
           if (!initial) selected.delete(source.key);
           else status(`${archive.incomplete ? 'Partially complete' : 'Complete'}: ${archive.saved}/${archive.total} images, ${archive.pages} pages.\n`
             + 'ZIP created. If the download has not started, click the save link below.'
+            + (archive.stitched ? `\nJoined ${archive.stitched} adjacent pairs; ${archive.imageFiles} image files in ZIP.` : '')
             + (archive.incomplete ? `\nMissing ${archive.missingPages} pages and ${archive.missingImages} images. See download-failures.json for details.` : ''));
         } catch (e) {
           if (cancelled || e.name === 'AbortError' || initial) throw e;
