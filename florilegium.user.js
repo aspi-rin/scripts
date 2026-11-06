@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Florilegium 留白花园
 // @namespace    https://github.com/aspi-rin/scripts
-// @version      0.2.0
+// @version      0.2.1
 // @description  在网页留白处生成植物图案，自动避让文字和控件；通过菜单按站点启用。
 // @author       aspi-rin
 // @license      MIT
@@ -137,7 +137,7 @@ const module = { exports: {} };
     return Array.from({ length: n + 1 }, (_, i) => cubic(points, i / n));
   }
 
-  function generate(options) {
+  function* generateSteps(options) {
     const settings = normalize(options);
     const { width, height, padding, spacing, scale, density } = settings;
     const rng = random(hash(`${settings.seed}/layout`));
@@ -150,6 +150,7 @@ const module = { exports: {} };
         const free = clearance(p, settings);
         if (free > 0) cells.push({ ...p, free, near: Infinity });
       }
+      yield;
     }
     const root = cells.filter(p => p.free >= 5 * scale).sort((a, b) =>
       distance(a, { x: padding + 24 * scale, y: height - padding - 16 * scale }) -
@@ -208,6 +209,7 @@ const module = { exports: {} };
         }
         if (!next) break;
         p = next; parent = id;
+        yield;
       }
     }
     if (!anchors.length) return scene;
@@ -224,6 +226,7 @@ const module = { exports: {} };
     const limit = Math.min(settings.maxMotifs, Math.round(110 * density));
     const minimum = 5.5 * scale / Math.sqrt(density);
     for (let attempt = 0; attempt < limit * 5 && scene.motifs.length < limit; attempt++) {
+      yield;
       scene.attempts++;
       let selected = null, score = -1;
       for (const c of cells) {
@@ -255,6 +258,28 @@ const module = { exports: {} };
       reserve(center, radius);
     }
     return scene;
+  }
+
+  // Both entry points consume the same steps, preserving seeded geometry.
+  function generate(options) {
+    const steps = generateSteps(options);
+    let next;
+    do { next = steps.next(); } while (!next.done);
+    return next.value;
+  }
+
+  async function generateAsync(options, isCancelled = () => false) {
+    const steps = generateSteps(options);
+    let started = performance.now();
+    while (!isCancelled()) {
+      const next = steps.next();
+      if (next.done) return next.value;
+      if (performance.now() - started >= 5) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        started = performance.now();
+      }
+    }
+    return null;
   }
 
   function path(points) {
@@ -412,7 +437,7 @@ const module = { exports: {} };
     return controller;
   }
 
-  const api = { version: VERSION, generate, toSVG, mount };
+  const api = { version: VERSION, generate, generateAsync, toSVG, mount };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.Florilegium = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
@@ -486,7 +511,9 @@ function start() {
   layer.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;width:100%!important;height:100%!important;pointer-events:none!important;z-index:2147483646!important;overflow:hidden!important;contain:strict!important;';
   const shadow = layer.attachShadow({ mode: 'open' });
   document.body.append(layer);
-  let timer = null, disposed = false;
+  let timer = null, disposed = false, dirty = true;
+  let pending = null;
+  let renderedGeometry = null;
   const dark = matchMedia('(prefers-color-scheme: dark)');
   const observer = new MutationObserver(records => {
     if (records.some(record => record.target !== layer && !layer.contains(record.target))) schedule();
@@ -495,40 +522,68 @@ function start() {
     observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true,
       attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open'] });
   }
-  function draw() {
-    if (disposed) return;
+  function show(job) {
+    if (disposed || dirty || pending !== job || !job.scene || document.hidden) return;
+    scene = job.scene;
+    shadow.innerHTML = Flora.toSVG(scene, { decorative: true });
+    shadow.firstElementChild.style.cssText = 'display:block;width:100%;height:100%;';
+    renderedGeometry = job.geometry;
+    pending = null;
+    layer.style.setProperty('visibility', 'visible', 'important');
+  }
+  async function draw() {
+    if (disposed || document.hidden) return;
     observer.disconnect();
+    let box;
     try {
       if (!layer.isConnected) document.body.append(layer);
-      const box = measureVisible(layer);
-      if (!box) { shadow.replaceChildren(); scene = null; return; }
-      scene = Flora.generate({ ...box, seed: settings.seed, density: settings.density,
-        spacing: 13, gap: 9, padding: 12, scale: 0.85, maxMotifs: 110,
-        ink: dark.matches ? '#9abbd5' : '#244f79' });
-      shadow.innerHTML = Flora.toSVG(scene, { decorative: true });
-      shadow.firstElementChild.style.cssText = 'display:block;width:100%;height:100%;';
-      layer.style.visibility = 'visible';
+      box = measureVisible(layer);
     } catch (error) {
-      scene = null; shadow.replaceChildren();
+      pending = null; scene = null; renderedGeometry = null; shadow.replaceChildren();
       console.warn('Florilegium:', error);
+      return;
     } finally { if (!disposed) observe(); }
+    if (!box) { pending = null; shadow.replaceChildren(); scene = null; renderedGeometry = null; return; }
+    const geometry = JSON.stringify([box, dark.matches]);
+    dirty = false;
+    if (geometry === renderedGeometry && scene) {
+      pending = null;
+      layer.style.setProperty('visibility', 'visible', 'important');
+      return;
+    }
+    if (pending?.geometry === geometry) { show(pending); return; }
+    const job = pending = { geometry, scene: null };
+    try {
+      job.scene = await Flora.generateAsync({ ...box, seed: settings.seed, density: settings.density,
+        spacing: 13, gap: 9, padding: 12, scale: 0.85, maxMotifs: 110,
+        ink: dark.matches ? '#9abbd5' : '#244f79' }, () => disposed || pending !== job || document.hidden);
+      show(job);
+    } catch (error) {
+      if (disposed || pending !== job) return;
+      pending = null; scene = null; renderedGeometry = null; shadow.replaceChildren();
+      console.warn('Florilegium:', error);
+    }
   }
   function schedule() {
     if (disposed) return;
-    // Hide the old mask immediately while content is moving.
-    layer.style.visibility = 'hidden';
+    dirty = true;
+    if (document.hidden) pending = null;
+    // Keep computing, but publish only after fresh geometry confirms the result.
+    layer.style.setProperty('visibility', 'hidden', 'important');
     clearTimeout(timer);
-    timer = setTimeout(draw, 180);
+    if (!document.hidden) timer = setTimeout(draw, 180);
   }
   const events = ['scroll', 'resize', 'load', 'click', 'input', 'pointerover', 'focusin', 'transitionend', 'animationend'];
   for (const event of events) window.addEventListener(event, schedule, { capture: true, passive: true });
+  document.addEventListener('visibilitychange', schedule);
   dark.addEventListener('change', schedule);
   document.fonts?.ready.then(schedule);
   document.fonts?.addEventListener('loadingdone', schedule);
   stop = () => {
     if (disposed) return;
-    disposed = true; clearTimeout(timer); observer.disconnect();
+    disposed = true; pending = null; clearTimeout(timer); observer.disconnect();
     for (const event of events) window.removeEventListener(event, schedule, true);
+    document.removeEventListener('visibilitychange', schedule);
     dark.removeEventListener('change', schedule);
     document.fonts?.removeEventListener('loadingdone', schedule);
     layer.remove(); scene = null;
