@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Florilegium 留白花园
 // @namespace    https://github.com/aspi-rin/scripts
-// @version      0.2.1
+// @version      0.2.2
 // @description  在网页留白处生成植物图案，自动避让文字和控件；通过菜单按站点启用。
 // @author       aspi-rin
 // @license      MIT
@@ -442,8 +442,7 @@ const module = { exports: {} };
   else global.Florilegium = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 
-// This file is appended inside the generated userscript's private scope.
-// GM APIs below are shared by Tampermonkey and ScriptCat.
+// Measure and decorate in document coordinates. Scrolling never invalidates layout.
 const Flora = module.exports;
 if (window.top !== window.self || !document.body || !/^https?:$/.test(location.protocol)) return;
 
@@ -456,139 +455,161 @@ const settings = {
   seed: Number.isFinite(stored?.seed) ? stored.seed : 7,
   density: densities.includes(stored?.density) ? stored.density : 0.65,
 };
-let menuIds = [];
-let stop = null;
-let scene = null;
+let menuIds = [], stop = null, garden = null;
 
-function visibleRect(rect, width, height) {
-  const x = Math.max(0, rect.left), y = Math.max(0, rect.top);
-  const right = Math.min(width, rect.right), bottom = Math.min(height, rect.bottom);
-  return right > x && bottom > y ? { x, y, width: right - x, height: bottom - y } : null;
-}
-
-// Protect visible text lines as well as image/control surfaces. Unknown or excessive
-// content produces no decoration rather than a partially measured protection mask.
-function measureVisible(layer) {
-  const width = Math.min(innerWidth, 8192), height = Math.min(innerHeight, 8192);
-  if (width < 32 || height < 32) return null;
+async function measureDocument(layer, cancelled) {
+  // Exclude our absolute layer when measuring a page that may have shrunk.
+  layer.style.setProperty('display', 'none', 'important');
+  const root = document.documentElement;
+  const width = Math.min(8192, Math.max(root.clientWidth, root.scrollWidth, document.body.scrollWidth));
+  const height = Math.max(root.clientHeight, root.scrollHeight, document.body.scrollHeight);
+  layer.style.setProperty('display', 'block', 'important');
+  if (width < 32 || height < 32 || !Number.isFinite(height)) return null;
+  const origin = layer.getBoundingClientRect();
+  const originX = origin.left + scrollX, originY = origin.top + scrollY;
   const obstacles = [];
+  let started = performance.now(), visited = 0;
+  const add = rect => {
+    const x = Math.max(0, rect.left + scrollX - originX);
+    const y = Math.max(0, rect.top + scrollY - originY);
+    const right = Math.min(width, rect.right + scrollX - originX);
+    const bottom = Math.min(height, rect.bottom + scrollY - originY);
+    if (right > x && bottom > y) obstacles.push({ x, y, width: right - x, height: bottom - y });
+  };
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const range = document.createRange();
-  let node, visited = 0;
+  let node;
   while ((node = walker.nextNode())) {
-    if (++visited > 16000) return null;
+    if (cancelled() || ++visited > 50000 || obstacles.length > 64000) return null;
+    if (performance.now() - started >= 5) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (cancelled()) return null;
+      started = performance.now();
+    }
     const parent = node.parentElement;
-    if (!parent || !node.nodeValue.trim() || parent.closest('script,style,noscript,template,[hidden]') || layer.contains(parent)) continue;
+    if (!parent || !node.nodeValue.trim() || parent.closest('script,style,noscript,template,[hidden]')) continue;
     const style = getComputedStyle(parent);
     if (style.visibility === 'hidden' || style.display === 'none') continue;
-    const parentBox = parent.getBoundingClientRect();
-    if (parentBox.bottom <= 0 || parentBox.top >= height || parentBox.right <= 0 || parentBox.left >= width) continue;
     range.selectNodeContents(node);
-    for (const rect of range.getClientRects()) {
-      const r = visibleRect(rect, width, height);
-      if (r) obstacles.push(r);
-      if (obstacles.length > 1600) return null;
-    }
+    for (const rect of range.getClientRects()) add(rect);
   }
   const surfaces = document.body.querySelectorAll('img,svg,canvas,video,iframe,button,input,select,textarea,[contenteditable]:not([contenteditable="false"]),[role="button"],[role="img"],[data-flora-keep]');
   if (surfaces.length > 16000) return null;
   for (const surface of surfaces) {
-    if (layer.contains(surface) || getComputedStyle(surface).visibility === 'hidden') continue;
-    const r = visibleRect(surface.getBoundingClientRect(), width, height);
-    if (r) obstacles.push(r);
-    if (obstacles.length > 1600) return null;
+    if (cancelled() || obstacles.length > 64000) return null;
+    if (performance.now() - started >= 5) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (cancelled()) return null;
+      started = performance.now();
+    }
+    if (getComputedStyle(surface).visibility !== 'hidden') add(surface.getBoundingClientRect());
   }
   return { width, height, obstacles };
 }
 
 function start() {
   stop?.();
-  scene = null;
+  garden = null;
   if (!settings.enabled) { stop = null; return; }
   const layer = document.createElement('div');
   layer.id = 'florilegium-userscript-layer';
   layer.setAttribute('aria-hidden', 'true');
-  layer.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;width:100%!important;height:100%!important;pointer-events:none!important;z-index:2147483646!important;overflow:hidden!important;contain:strict!important;';
+  layer.style.cssText = 'all:initial!important;position:absolute!important;left:0!important;top:0!important;width:0!important;height:0!important;pointer-events:none!important;z-index:0!important;overflow:hidden!important;contain:strict!important;visibility:hidden!important;';
   const shadow = layer.attachShadow({ mode: 'open' });
-  document.body.append(layer);
-  let timer = null, disposed = false, dirty = true;
-  let pending = null;
-  let renderedGeometry = null;
+  document.documentElement.append(layer);
+  let timer = null, disposed = false, revision = 0, renderedGeometry = null;
   const dark = matchMedia('(prefers-color-scheme: dark)');
   const observer = new MutationObserver(records => {
-    if (records.some(record => record.target !== layer && !layer.contains(record.target))) schedule();
+    if (records.some(r => r.target !== layer && !layer.contains(r.target))) schedule();
   });
-  function observe() {
-    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true,
-      attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open'] });
-  }
-  function show(job) {
-    if (disposed || dirty || pending !== job || !job.scene || document.hidden) return;
-    scene = job.scene;
-    shadow.innerHTML = Flora.toSVG(scene, { decorative: true });
-    shadow.firstElementChild.style.cssText = 'display:block;width:100%;height:100%;';
-    renderedGeometry = job.geometry;
-    pending = null;
-    layer.style.setProperty('visibility', 'visible', 'important');
-  }
+  observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true,
+    attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open'] });
   async function draw() {
     if (disposed || document.hidden) return;
-    observer.disconnect();
-    let box;
+    const drawing = revision;
+    const cancelled = () => disposed || drawing !== revision || document.hidden;
     try {
-      if (!layer.isConnected) document.body.append(layer);
-      box = measureVisible(layer);
+      const box = await measureDocument(layer, cancelled);
+      if (cancelled()) return;
+      if (!box) { shadow.replaceChildren(); garden = null; renderedGeometry = null; return; }
+      const geometry = JSON.stringify([box, dark.matches]);
+      if (geometry === renderedGeometry && garden) {
+        layer.dataset.floraReady = 'true';
+        layer.style.setProperty('visibility', 'visible', 'important');
+        return;
+      }
+      renderedGeometry = null;
+      shadow.replaceChildren();
+      layer.style.setProperty('width', `${box.width}px`, 'important');
+      layer.style.setProperty('height', `${box.height}px`, 'important');
+      const snapshot = { width: box.width, height: box.height, tiles: [], complete: false };
+      garden = snapshot;
+      // Independent sections bound the solver's grid and release each scene after SVG output.
+      const count = Math.ceil(box.height / 1000), sectionHeight = box.height / count;
+      const current = Math.min(count - 1, Math.max(0, Math.floor(scrollY / sectionHeight)));
+      const order = [current, ...Array.from({ length: count }, (_, i) => i).filter(i => i !== current)];
+      for (const index of order) {
+        if (cancelled()) return;
+        const top = index * sectionHeight;
+        const obstacles = box.obstacles.filter(r => r.y + r.height + 9 >= top && r.y - 9 < top + sectionHeight)
+          .map(r => ({ ...r, y: r.y - top }));
+        // A dense section stays undecorated rather than using an incomplete mask.
+        if (obstacles.length > 1600) continue;
+        const scene = await Flora.generateAsync({ width: box.width, height: sectionHeight, obstacles,
+          seed: `${settings.seed}/section/${index}`, density: settings.density,
+          spacing: 13, gap: 9, padding: 12, scale: 0.85, maxMotifs: Math.max(4, Math.min(110, Math.floor(800 / count))),
+          ink: dark.matches ? '#9abbd5' : '#244f79' }, cancelled);
+        if (!scene || cancelled()) return;
+        const section = document.createElement('div');
+        section.style.cssText = `position:absolute;left:0;top:${top}px;width:${box.width}px;height:${sectionHeight}px;contain:strict;pointer-events:none;`;
+        section.innerHTML = Flora.toSVG(scene, { decorative: true });
+        section.firstElementChild.style.cssText = 'display:block;width:100%;height:100%;';
+        shadow.append(section);
+        snapshot.tiles[index] = { top, svg: section.firstElementChild };
+        layer.style.setProperty('visibility', 'visible', 'important');
+      }
+      if (!cancelled()) {
+        snapshot.complete = true;
+        renderedGeometry = geometry;
+        layer.dataset.floraReady = 'true';
+      }
     } catch (error) {
-      pending = null; scene = null; renderedGeometry = null; shadow.replaceChildren();
-      console.warn('Florilegium:', error);
-      return;
-    } finally { if (!disposed) observe(); }
-    if (!box) { pending = null; shadow.replaceChildren(); scene = null; renderedGeometry = null; return; }
-    const geometry = JSON.stringify([box, dark.matches]);
-    dirty = false;
-    if (geometry === renderedGeometry && scene) {
-      pending = null;
-      layer.style.setProperty('visibility', 'visible', 'important');
-      return;
-    }
-    if (pending?.geometry === geometry) { show(pending); return; }
-    const job = pending = { geometry, scene: null };
-    try {
-      job.scene = await Flora.generateAsync({ ...box, seed: settings.seed, density: settings.density,
-        spacing: 13, gap: 9, padding: 12, scale: 0.85, maxMotifs: 110,
-        ink: dark.matches ? '#9abbd5' : '#244f79' }, () => disposed || pending !== job || document.hidden);
-      show(job);
-    } catch (error) {
-      if (disposed || pending !== job) return;
-      pending = null; scene = null; renderedGeometry = null; shadow.replaceChildren();
+      if (cancelled()) return;
+      garden = null; renderedGeometry = null; shadow.replaceChildren();
       console.warn('Florilegium:', error);
     }
   }
-  function schedule() {
-    if (disposed) return;
-    dirty = true;
-    if (document.hidden) pending = null;
-    // Keep computing, but publish only after fresh geometry confirms the result.
+  function schedule(event) {
+    if (disposed || event?.target === layer) return;
+    revision++;
+    delete layer.dataset.floraReady;
     layer.style.setProperty('visibility', 'hidden', 'important');
     clearTimeout(timer);
     if (!document.hidden) timer = setTimeout(draw, 180);
   }
-  const events = ['scroll', 'resize', 'load', 'click', 'input', 'pointerover', 'focusin', 'transitionend', 'animationend'];
+  const events = ['resize', 'load'];
   for (const event of events) window.addEventListener(event, schedule, { capture: true, passive: true });
   document.addEventListener('visibilitychange', schedule);
   dark.addEventListener('change', schedule);
-  document.fonts?.ready.then(schedule);
+  document.fonts?.ready.then(() => schedule());
   document.fonts?.addEventListener('loadingdone', schedule);
+  let previousSize = null;
+  const resizeObserver = new ResizeObserver(entries => {
+    const r = entries[0].contentRect, size = `${r.width}/${r.height}`;
+    if (previousSize !== null && size !== previousSize) schedule();
+    previousSize = size;
+  });
+  resizeObserver.observe(document.body);
   stop = () => {
     if (disposed) return;
-    disposed = true; pending = null; clearTimeout(timer); observer.disconnect();
+    disposed = true; clearTimeout(timer); observer.disconnect(); resizeObserver.disconnect();
     for (const event of events) window.removeEventListener(event, schedule, true);
     document.removeEventListener('visibilitychange', schedule);
     dark.removeEventListener('change', schedule);
     document.fonts?.removeEventListener('loadingdone', schedule);
-    layer.remove(); scene = null;
+    layer.remove(); garden = null;
   };
-  draw();
+  schedule();
 }
 
 async function saveAndApply() {
@@ -615,8 +636,14 @@ function menus() {
     await saveAndApply();
   });
   add('保存当前花园 SVG', () => {
-    if (!scene) return;
-    const url = URL.createObjectURL(new Blob([Flora.toSVG(scene)], { type: 'image/svg+xml' }));
+    if (!garden) return;
+    const sections = garden.tiles.filter(Boolean).map(t => {
+      const svg = t.svg.cloneNode(true);
+      svg.removeAttribute('style');
+      return `<g transform="translate(0 ${t.top})">${svg.outerHTML}</g>`;
+    }).join('');
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${garden.width}" height="${garden.height}" viewBox="0 0 ${garden.width} ${garden.height}">${sections}</svg>`;
+    const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
     const link = document.createElement('a');
     link.href = url;
     link.download = `florilegium-${location.hostname.replace(/[^a-z0-9.-]/gi, '_')}-${settings.seed}.svg`;
